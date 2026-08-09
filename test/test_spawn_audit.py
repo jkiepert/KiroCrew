@@ -235,6 +235,44 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/backend/clone_setup.py::_run",
         "apps/builtins/auto_improvement/backend/clone_setup.py::list_clone_branches",
         "apps/builtins/auto_improvement/backend/clone_setup.py::setup_safe_clone",
+        # pr-postmortem: READ-ONLY `git` (`show`/`log`/`blame`/`diff`/`rev-parse`)
+        # and optional `gh ... --json`, run against the OPERATOR-configured clone
+        # named in the app's own state.json (`repos[].repo_path`). Same class as
+        # code_reviewer/git.py, which this module's docstring already lists as an
+        # allowlisted operator-configured-repo case: the path is set by the operator
+        # in a file the agent does not write through any route, argv[0] is a literal,
+        # and there is no shell=True anywhere in the engine.
+        #
+        # The one genuinely attacker-influenced input is a FILE PATH read out of the
+        # repository's own diff -- somebody can open a pull request adding a file
+        # named `--upload-pack=...`. Both call sites that pass a repo-derived path
+        # put it after a `--` separator (engine/attribution.py `[rev, "--", path]`
+        # and engine/bundle.py `[..., "--", *blamed_files]`), so git parses it as a
+        # pathspec and never as an option.
+        #
+        # NOT sandboxed for the reason code_review_sage's `gh` is not: gh needs the
+        # host's own authenticated credentials, and the attribution tests drive a
+        # real synthetic git repository that a sandbox wrapper would have to
+        # tolerate.
+        "apps/builtins/pr_postmortem/engine/vcs.py::_run",
+        # DEV-ONLY measurement harness: not imported by the app at runtime (no route,
+        # cron or skill references it), run by a maintainer to score attribution
+        # quality against hand-judged pairs. Fixed git argv against a repo path the
+        # operator passes on the command line.
+        "apps/builtins/pr_postmortem/tools/validate.py::cmd_blame_strength",
+        # TEST-ONLY: builds a synthetic repository under tmp_path with fixed argv
+        # (`git init`/`add`/`commit`) so the attribution engine can be tested against
+        # real git output rather than a mock of it. No agent-derived input.
+        "apps/builtins/pr_postmortem/tests/test_attribution_e2e.py::_git",
+        # TEST-ONLY, same class as the line above: builds a synthetic repository
+        # under tmp_path with fixed `git` argv to prove two review findings stay
+        # fixed (blame keyed by the final line; a merge commit still yields a
+        # diff). Both only reproduce against real git output.
+        "apps/builtins/pr_postmortem/tests/test_review_regressions.py::_git",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run``), used here only to drive an async aiohttp handler from a
+        # synchronous test. Same classification as the ``asyncio.run`` sites above.
+        "apps/builtins/pr_postmortem/tests/test_backend_routes.py::_run",
         # NOT subprocess spawns: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``), used here only to drive the async
         # ``SessionAgentRunner._approve`` coroutine from a synchronous test. No child

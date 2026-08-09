@@ -276,6 +276,23 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.pptxMaker.manifest.highlight_6',
     ],
   },
+  'pr-postmortem': {
+    displayName: 'apps.prPostmortem.manifest.display_name',
+    description: 'apps.prPostmortem.manifest.description',
+    pageLabel: 'apps.prPostmortem.manifest.page_label',
+    highlights: [
+      'apps.prPostmortem.manifest.highlight_1',
+      'apps.prPostmortem.manifest.highlight_2',
+      'apps.prPostmortem.manifest.highlight_3',
+      'apps.prPostmortem.manifest.highlight_4',
+      'apps.prPostmortem.manifest.highlight_5',
+      'apps.prPostmortem.manifest.highlight_6',
+      'apps.prPostmortem.manifest.highlight_7',
+      'apps.prPostmortem.manifest.highlight_8',
+      'apps.prPostmortem.manifest.highlight_9',
+      'apps.prPostmortem.manifest.highlight_10',
+    ],
+  },
   'projects': {
     displayName: 'apps.projects.manifest.display_name',
     description: 'apps.projects.manifest.description',
