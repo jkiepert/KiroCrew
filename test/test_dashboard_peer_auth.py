@@ -43,6 +43,34 @@ INTERNAL = frozenset({"/api/spawn"})
 
 
 # ---------------------------------------------------------------------------
+# AF_UNIX socket paths are limited to ~104 bytes on most POSIX systems.
+# pytest's tmp_path can exceed this when the workspace path is long (common
+# in CI worktrees).  This fixture provides a short-path directory in /tmp.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def short_tmp(tmp_path: Path):
+    """Provide a tmp dir short enough for AF_UNIX bind (max ~104 chars).
+
+    Uses the standard ``tmp_path`` when it is short enough, otherwise
+    falls back to a subdirectory of ``/tmp`` to stay within the kernel limit.
+    """
+    import shutil
+    import tempfile
+
+    # 50 chars leaves room for socket filenames up to ~54 chars.
+    if len(str(tmp_path)) <= 50:
+        yield tmp_path
+    else:
+        short = Path(tempfile.mkdtemp(prefix="kc_sock_"))
+        try:
+            yield short
+        finally:
+            shutil.rmtree(short, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # peer_resolve — the shared ancestry walk
 # ---------------------------------------------------------------------------
 
@@ -405,7 +433,7 @@ def _unix_http_request(
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_unix_site_end_to_end_peer_verification(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    short_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real UnixSite + real AF_UNIX connect: the kernel reports OUR pid/uid,
     so with a session_pid file for an ancestor of this test process the
@@ -421,14 +449,14 @@ async def test_unix_site_end_to_end_peer_verification(
     _hmac_key = b"K" * 32
     monkeypatch.setattr(sps, "_load_hmac_key", lambda: _hmac_key)
     pid = os.getpid()
-    (tmp_path / f"session_pid_{pid}.txt").write_text("dashboard:chat-e2e", encoding="utf-8")
-    (tmp_path / f"session_pid_{pid}.sig").write_text(
+    (short_tmp / f"session_pid_{pid}.txt").write_text("dashboard:chat-e2e", encoding="utf-8")
+    (short_tmp / f"session_pid_{pid}.sig").write_text(
         sps._compute_sig(_hmac_key, pid, "dashboard:chat-e2e"), encoding="utf-8"
     )
     monkeypatch.setattr(
         ta,
         "resolve_peer_identity",
-        lambda p, **kw: resolve_peer_identity(p, config_dir_fn=lambda: tmp_path, **kw),
+        lambda p, **kw: resolve_peer_identity(p, config_dir_fn=lambda: short_tmp, **kw),
     )
 
     app = web.Application()
@@ -442,7 +470,7 @@ async def test_unix_site_end_to_end_peer_verification(
     app.router.add_get("/api/spawn", handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    sock_path = str(tmp_path / "dash-test.sock")
+    sock_path = str(short_tmp / "dash-test.sock")
     site = web.UnixSite(runner, sock_path)
     await site.start()
     try:
@@ -501,17 +529,17 @@ def test_check_origin_still_rejects_plain_remote_without_origin() -> None:
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_start_unix_site_binds_and_removes_stale(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    short_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from kiro_crew.dashboard import server as srv
 
     monkeypatch.setattr(
         "kiro_crew.dashboard.server.dashboard_socket_path",
-        lambda port: tmp_path / f"dashboard-{port}.sock",
+        lambda port: short_tmp / f"dashboard-{port}.sock",
     )
     # Plant a stale socket file (bound then abandoned) to prove self-healing.
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale.bind(str(tmp_path / "dashboard-5999.sock"))
+    stale.bind(str(short_tmp / "dashboard-5999.sock"))
     stale.close()
 
     app = web.Application()
@@ -564,7 +592,7 @@ async def test_start_unix_site_bind_failure_degrades(
 
 
 @pytest.fixture()
-def unix_http_server(tmp_path: Path):
+def unix_http_server(short_tmp: Path):
     """A minimal threaded HTTP server on an AF_UNIX socket."""
     import http.server
     import socketserver
@@ -591,7 +619,7 @@ def unix_http_server(tmp_path: Path):
             request, _ = super().get_request()
             return request, ("unix", 0)
 
-    sock_path = str(tmp_path / "client-test.sock")
+    sock_path = str(short_tmp / "client-test.sock")
     server = _UnixServer(sock_path, _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -615,7 +643,7 @@ def test_loopback_urlopen_absent_socket_falls_back_to_tcp(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
-def test_loopback_urlopen_stale_socket_falls_back_to_tcp(tmp_path: Path) -> None:
+def test_loopback_urlopen_stale_socket_falls_back_to_tcp(short_tmp: Path) -> None:
     """Socket file exists but nobody listens → connect refused → TCP fallback.
 
     The TCP side serves a real response, proving the fallback actually runs
@@ -623,7 +651,7 @@ def test_loopback_urlopen_stale_socket_falls_back_to_tcp(tmp_path: Path) -> None
     import http.server
     import threading
 
-    stale_path = tmp_path / "stale.sock"
+    stale_path = short_tmp / "stale.sock"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(str(stale_path))
     s.close()  # bound but never listened/accepting → ECONNREFUSED
@@ -653,7 +681,7 @@ def test_loopback_urlopen_stale_socket_falls_back_to_tcp(tmp_path: Path) -> None
 
 
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
-def test_loopback_urlopen_http_error_propagates_no_fallback(tmp_path: Path) -> None:
+def test_loopback_urlopen_http_error_propagates_no_fallback(short_tmp: Path) -> None:
     """A 4xx over the unix socket is a REAL response — it must propagate as
     HTTPError, never trigger a duplicate TCP send."""
     import http.server
@@ -676,7 +704,7 @@ def test_loopback_urlopen_http_error_propagates_no_fallback(tmp_path: Path) -> N
             request, _ = super().get_request()
             return request, ("unix", 0)
 
-    sock_path = str(tmp_path / "err.sock")
+    sock_path = str(short_tmp / "err.sock")
     server = _UnixServer(sock_path, _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()

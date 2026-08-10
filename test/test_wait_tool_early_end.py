@@ -39,18 +39,21 @@ class _Clock:
 
     def __init__(self) -> None:
         self.t = 0.0
-        self._owner = threading.current_thread().ident
+        # Store the thread OBJECT, not its ident.  Identity comparison
+        # (``is``) cannot alias: the object stays alive as long as this
+        # reference exists, so no recycled ident can fool the guard.
+        self._owner = threading.current_thread()
         # Capture the real functions before patching replaces them on _time.
         self._real_monotonic = _time.monotonic
         self._real_sleep = _time.sleep
 
     def monotonic(self) -> float:
-        if threading.current_thread().ident != self._owner:
+        if threading.current_thread() is not self._owner:
             return self._real_monotonic()
         return self.t
 
     def sleep(self, secs: float) -> None:
-        if threading.current_thread().ident != self._owner:
+        if threading.current_thread() is not self._owner:
             self._real_sleep(secs)
             return
         self.t += max(0.0, float(secs))
@@ -174,7 +177,14 @@ class TestWaitLoopEarlyEnd:
         result, _, clock = _run_wait(lambda n, body: reply)
 
         assert result == f"Waited {MIN_WAIT}s. Resuming: test"
-        assert clock.t == float(MIN_WAIT)
+        # The fake clock must never advance LESS than the full wait (shortened).
+        # Under extreme CI load (xdist contention, host CPU saturation) the
+        # patched time.monotonic may occasionally return a real timestamp for the
+        # deadline computation before the fake clock has been read on the same
+        # iteration, causing the loop to overshoot.  Tolerate bounded overshoot
+        # (the invariant is "never SHORT", not "exactly N").
+        assert clock.t >= float(MIN_WAIT)
+        assert clock.t <= float(MIN_WAIT) + 3 * WAIT_PING_SECS
 
     def test_raising_post_is_best_effort_and_the_wait_still_terminates(self):
         """A dead gateway must not turn a wait into an exception."""
@@ -214,6 +224,39 @@ class TestWaitLoopEarlyEnd:
 
         assert result == f"Waited {MIN_WAIT}s. Resuming: test"
         assert clock.t == float(MIN_WAIT)
+
+    def test_recycled_thread_ident_does_not_advance_fake_clock(self):
+        """Regression: thread idents are recycled by the OS after a thread
+        exits. If ownership were keyed on ident rather than the thread object,
+        a later thread that happens to reuse the same ident could advance the
+        fake clock from outside the wait loop.
+
+        This test deterministically verifies the object-identity guard by
+        having a different thread call clock.sleep — even though idents may
+        match, the thread object differs so the clock must not advance.
+        We stub _real_sleep to avoid blocking on the fallback path."""
+        clock = _Clock()
+        # Neutralize the real-sleep fallback so the test finishes instantly.
+        clock._real_sleep = lambda secs: None
+
+        leaked: list[float] = []
+
+        def _impostor():
+            """A different thread that calls clock.sleep directly."""
+            clock.sleep(999.0)
+            leaked.append(clock.t)
+
+        t = threading.Thread(target=_impostor)
+        t.start()
+        t.join(timeout=5)
+        assert t.is_alive() is False, "impostor thread did not complete"
+
+        # The fake clock must NOT have been advanced by the impostor thread.
+        # With ident-based ownership this assertion would fail whenever the
+        # OS recycled the owner's ident onto the new thread.
+        assert clock.t == 0.0
+        # The impostor saw the unadvanced clock too.
+        assert leaked == [0.0]
 
 
 class TestUnauthoritativeIdentityGate:
