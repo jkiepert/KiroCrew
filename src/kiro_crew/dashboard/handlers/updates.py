@@ -21,12 +21,12 @@ from kiro_crew import shutdown_event
 from kiro_crew.beacon import distribution
 from kiro_crew.changelog import Release, build_release_list
 from kiro_crew.config.loader import (
+    ConfigBusyError,
     ConfigReadError,
     KiroCrewConfig,
+    amutate_config,
     config_dir,
     config_path,
-    read_config_for_update,
-    write_config_atomically,
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.platform.update_governance import (
@@ -679,19 +679,35 @@ async def api_update_auto(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
     enabled = body.get("enabled", True)
-    # Read, modify, write config. The read fails CLOSED: treating an unreadable
-    # config as {} would write back a single-key file and wipe every other
-    # setting the user has (see read_config_for_update).
-    path = config_path()
+    # One transaction covering the read AND the write. Reading and then writing as two
+    # separate steps is what loses a concurrent settings save: both callers read the
+    # same snapshot and the second write discards the first's change. Locking only the
+    # write would not help -- the gap being closed is between the read and the write.
+    #
+    # ``amutate_config`` runs that transaction on a worker thread. The lock wait is
+    # blocking, so taking it inline here would stall the gateway's event loop and with
+    # it every session and the liveness heartbeat.
+    #
+    # The read still fails CLOSED: treating an unreadable config as {} would write back
+    # a single-key file and wipe every other setting the user has.
     try:
-        data = read_config_for_update(path)
+        await amutate_config(
+            lambda data: data.__setitem__("auto_update", enabled), config_path()
+        )
     except ConfigReadError:
         logger.exception("Refusing to toggle auto-update: config is unreadable")
         return web.json_response(
             {"error": "failed to read config file", "code": "config_unreadable"}, status=500
         )
-    data["auto_update"] = enabled
-    write_config_atomically(path, data)
+    except ConfigBusyError:
+        # A concurrent writer held the config. Reporting 409 beats both alternatives:
+        # returning ok would claim a save that did not happen, and silently retrying
+        # could overwrite whatever the other writer just stored.
+        logger.warning("Auto-update toggle skipped: config busy")
+        return web.json_response(
+            {"error": "config is being updated elsewhere; retry", "code": "config_busy"},
+            status=409,
+        )
     return web.json_response({"ok": True, "auto_update": enabled})
 
 

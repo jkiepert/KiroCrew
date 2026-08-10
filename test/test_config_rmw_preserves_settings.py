@@ -370,3 +370,65 @@ class TestAutoUpdateToggleKeepsSettings:
         # The unreadable file is left exactly as it was — not replaced by a
         # one-key config that silently drops every real setting.
         assert path.read_text(encoding="utf-8") == torn
+
+
+class TestAutoUpdateToggleUnderContention:
+    """The endpoint must not claim a save that a concurrent writer prevented.
+
+    This is the behaviour change from the transaction: previously the toggle read, then
+    wrote, and a settings save landing between the two was silently destroyed. Now the
+    write refuses, and the endpoint has to say so rather than returning ok.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_held_lock_yields_409_and_changes_nothing(self, tmp_path, monkeypatch):
+        import threading
+
+        from kiro_crew.config.loader import config_transaction
+        from kiro_crew.dashboard.handlers import updates
+
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(_REAL_SETTINGS, indent=2), encoding="utf-8")
+        monkeypatch.setattr(updates, "config_path", lambda: path)
+        before = path.read_bytes()
+
+        holding = threading.Event()
+        release = threading.Event()
+
+        def holder() -> None:
+            with config_transaction(path):
+                holding.set()
+                release.wait(timeout=10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert holding.wait(timeout=10)
+
+        class _Req:
+            async def json(self):
+                return {"enabled": False}
+
+        try:
+            # A short timeout keeps the test fast; the point is the refusal, not the wait.
+            monkeypatch.setattr(
+                updates,
+                "amutate_config",
+                _short_timeout(updates.amutate_config),
+            )
+            resp = await updates.api_update_auto(_Req())
+        finally:
+            release.set()
+            t.join(10)
+
+        assert resp.status == 409
+        assert path.read_bytes() == before, "the config was modified despite the refusal"
+
+
+def _short_timeout(fn):
+    """Wrap amutate_config so the contended test does not wait the full 5s default."""
+
+    async def inner(mutate, path=None, **kw):
+        kw["timeout"] = 0.05
+        return await fn(mutate, path, **kw)
+
+    return inner
