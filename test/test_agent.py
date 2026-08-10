@@ -4290,6 +4290,364 @@ class TestRefreshDynamicFieldsSyncsConfigModel:
         assert config["model"] == "claude-sonnet-4.6"
 
 
+class TestRefreshDynamicFieldsUnpinsOnAuto:
+    """Returning ``agent.model`` to "auto" must un-pin a model the propagation
+    itself wrote, or the spec value outranks the global forever and Auto becomes
+    unreachable (at a higher credit multiplier than the user asked for)."""
+
+    def _write_mc_config(self, tmp_path: Path, model) -> Path:
+        mc = tmp_path / "config.json"
+        body = {} if model is None else {"agent": {"model": model}}
+        mc.write_text(json.dumps(body), encoding="utf-8")
+        return mc
+
+    @pytest.fixture(autouse=True)
+    def _clean_sidecar(self):
+        # Belt-and-braces on top of conftest's per-test sidecar isolation: these
+        # cases are decided BY the sidecar, so each states its own start state.
+        agent_state.prune("kirocrew")
+        yield
+        agent_state.prune("kirocrew")
+
+    def _refresh(self, tmp_path: Path, global_model, config: dict) -> dict:
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = self._write_mc_config(tmp_path, global_model)
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(config)
+        return config
+
+    def test_propagation_records_provenance(self, tmp_path: Path):
+        agent_state.set_model_managed("kirocrew", True)
+        config = self._refresh(
+            tmp_path, "claude-opus-4.8", {"name": "kirocrew", "model": "stale"}
+        )
+        assert config["model"] == "claude-opus-4.8"
+        assert agent_state.get_config_model("kirocrew") == "claude-opus-4.8"
+
+    def test_returning_global_to_auto_unpins_the_propagated_model(self, tmp_path: Path):
+        # The reporter's state: a model propagated by an older config, and no
+        # model_managed entry, so the shipped-default re-sync never fires.
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        assert agent_state.get_model_managed("kirocrew") is None
+        config = self._refresh(
+            tmp_path, "auto", {"name": "kirocrew", "model": "claude-opus-4.8"}
+        )
+        assert config["model"] == "auto"
+
+    def test_the_record_survives_the_unpin_so_a_lost_spec_write_retries(self, tmp_path: Path):
+        # The spec reaches disk long after this function returns. If the record
+        # were cleared here, a crash in between would leave the spec pinned with
+        # nothing left to recognize it by, and no later refresh could un-pin it.
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        interrupted = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        self._refresh(tmp_path, "auto", interrupted)
+        assert agent_state.get_config_model("kirocrew") == "claude-opus-4.8"
+        # Next refresh sees the spec as the failed write left it, and heals it.
+        retried = self._refresh(
+            tmp_path, "auto", {"name": "kirocrew", "model": "claude-opus-4.8"}
+        )
+        assert retried["model"] == "auto"
+
+    def test_unpin_is_idempotent(self, tmp_path: Path):
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        config = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        self._refresh(tmp_path, "auto", config)
+        self._refresh(tmp_path, "auto", config)
+        assert config["model"] == "auto"
+
+    def test_a_value_the_propagation_never_wrote_is_left_alone(self, tmp_path: Path):
+        # No provenance record → the spec model came from somewhere else (a hand
+        # edit, an older build's shipped default). Clearing it would be a
+        # one-way delete of a value this code never authored.
+        agent_state.set_config_model("kirocrew", None)
+        config = self._refresh(
+            tmp_path, "auto", {"name": "kirocrew", "model": "claude-haiku-4.5"}
+        )
+        assert config["model"] == "claude-haiku-4.5"
+
+    def test_a_diverged_value_is_left_alone(self, tmp_path: Path):
+        # Propagated 4.8, but the spec now says something else — the Agent
+        # Templates editor writes the spec directly, so that pick is its own.
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        config = self._refresh(
+            tmp_path, "auto", {"name": "kirocrew", "model": "claude-haiku-4.5"}
+        )
+        assert config["model"] == "claude-haiku-4.5"
+
+    def test_an_editor_pick_that_coincides_with_the_global_never_gets_a_record(
+        self, tmp_path: Path
+    ):
+        # Equality is not provenance. A pick that already agrees with the global is
+        # not recorded, which is what keeps it out of reach of the un-pin.
+        agent_state.set_model_managed("kirocrew", False)
+        config = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        self._refresh(tmp_path, "claude-opus-4.8", config)
+        assert agent_state.get_config_model("kirocrew") is None
+        self._refresh(tmp_path, "auto", config)
+        assert config["model"] == "claude-opus-4.8"
+
+    def test_a_hand_edited_pin_matching_the_global_is_not_erased(self, tmp_path: Path):
+        # Same rule, without any editor marker: a raw spec edit that happens to
+        # equal the global must survive a later return to auto.
+        assert agent_state.get_model_managed("kirocrew") is None
+        config = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        self._refresh(tmp_path, "claude-opus-4.8", config)
+        assert agent_state.get_config_model("kirocrew") is None
+        self._refresh(tmp_path, "auto", config)
+        assert config["model"] == "claude-opus-4.8"
+
+    def test_editor_pick_then_global_then_auto_still_reaches_auto(self, tmp_path: Path):
+        # A pick the propagation actually REPLACED is ours to un-pin, and the
+        # editor's freeze marker is not consulted — a record can only exist for a
+        # value this code overwrote.
+        agent_state.set_model_managed("kirocrew", False)
+        config = {"name": "kirocrew", "model": "claude-haiku-4.5"}
+        self._refresh(tmp_path, "claude-opus-4.8", config)
+        assert agent_state.get_config_model("kirocrew") == "claude-opus-4.8"
+        self._refresh(tmp_path, "auto", config)
+        assert config["model"] == "auto"
+
+    def test_a_reselected_editor_pick_matching_the_record_is_not_erased(self, tmp_path: Path):
+        # The editor clears provenance on every explicit write, so re-selecting the
+        # recorded value makes it the editor's, not ours.
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        agent_state.set_config_model("kirocrew", None)  # what the editor write does
+        config = self._refresh(
+            tmp_path, "auto", {"name": "kirocrew", "model": "claude-opus-4.8"}
+        )
+        assert config["model"] == "claude-opus-4.8"
+
+    def test_a_failing_provenance_write_still_propagates_the_model(self, tmp_path: Path):
+        # The propagation is the primary behaviour; bookkeeping is not allowed to
+        # block it (or the rest of the refresh) when the sidecar cannot be written.
+        config = {"name": "kirocrew", "model": "claude-haiku-4.5"}
+        with patch(
+            "kiro_crew.agent_state.set_config_model",
+            side_effect=OSError("unwritable sidecar"),
+        ):
+            self._refresh(tmp_path, "claude-opus-4.8", config)
+        assert config["model"] == "claude-opus-4.8"
+
+    def test_managed_resync_still_wins_when_global_is_auto(self, tmp_path: Path):
+        # A managed agent already heals via the shipped-default re-sync; the
+        # unpin must not fight it.
+        agent_state.set_model_managed("kirocrew", True)
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        config = self._refresh(
+            tmp_path, "auto", {"name": "kirocrew", "model": "claude-opus-4.8"}
+        )
+        assert config["model"] == "auto"
+
+    def test_repin_after_unpin_records_the_new_value(self, tmp_path: Path):
+        agent_state.set_config_model("kirocrew", None)
+        config = {"name": "kirocrew", "model": "auto"}
+        self._refresh(tmp_path, "claude-sonnet-4.6", config)
+        assert config["model"] == "claude-sonnet-4.6"
+        assert agent_state.get_config_model("kirocrew") == "claude-sonnet-4.6"
+        self._refresh(tmp_path, "auto", config)
+        assert config["model"] == "auto"
+
+
+class TestResolveConfigModelRecord:
+    """The propagated-model record is retired only after a spec that supersedes it
+    reaches disk, so an un-pin cannot outlive its own record and a failed write
+    cannot strand one."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        agent_state.prune("kirocrew")
+        yield
+        agent_state.prune("kirocrew")
+
+    def test_a_persisted_heal_retires_the_record(self):
+        from kiro_crew.agent import _resolve_config_model_record
+
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        # What the un-pin wrote, now persisted.
+        _resolve_config_model_record({"name": "kirocrew", "model": "auto"})
+        assert agent_state.get_config_model("kirocrew") is None
+
+    def test_a_persisted_pin_keeps_its_record(self):
+        from kiro_crew.agent import _resolve_config_model_record
+
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        _resolve_config_model_record({"name": "kirocrew", "model": "claude-opus-4.8"})
+        assert agent_state.get_config_model("kirocrew") == "claude-opus-4.8"
+
+    def test_a_persisted_value_owned_elsewhere_retires_the_record(self):
+        from kiro_crew.agent import _resolve_config_model_record
+
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        _resolve_config_model_record({"name": "kirocrew", "model": "claude-haiku-4.5"})
+        assert agent_state.get_config_model("kirocrew") is None
+
+    def test_a_concurrent_newer_record_is_not_discarded(self):
+        from kiro_crew.agent import _resolve_config_model_record
+
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        persisted = {"name": "kirocrew", "model": "auto"}
+
+        # A concurrent rebuild records a NEWER pin between the read and the clear.
+        real_get = agent_state.get_config_model
+
+        def racing_get(name: str):
+            value = real_get(name)
+            agent_state.set_config_model("kirocrew", "claude-sonnet-4.6")
+            return value
+
+        with patch("kiro_crew.agent_state.get_config_model", side_effect=racing_get):
+            _resolve_config_model_record(persisted)
+        assert agent_state.get_config_model("kirocrew") == "claude-sonnet-4.6"
+
+    def test_no_record_is_a_noop(self):
+        from kiro_crew.agent import _resolve_config_model_record
+
+        _resolve_config_model_record({"name": "kirocrew", "model": "auto"})
+        assert agent_state.get_config_model("kirocrew") is None
+
+    def test_a_nameless_config_is_a_noop(self):
+        from kiro_crew.agent import _resolve_config_model_record
+
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        _resolve_config_model_record({"model": "auto"})
+        assert agent_state.get_config_model("kirocrew") == "claude-opus-4.8"
+
+    def test_a_raw_edit_back_to_the_value_is_not_unpinned_after_a_persisted_heal(
+        self, tmp_path: Path
+    ):
+        # The window this closes: heal, then a raw spec edit back to the model.
+        # Once the heal has persisted the record is gone, so the later value is
+        # not mistaken for the old propagation.
+        from kiro_crew.agent import _refresh_dynamic_fields, _resolve_config_model_record
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": {"model": "auto"}}), encoding="utf-8")
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        healed = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(healed)
+        assert healed["model"] == "auto"
+        _resolve_config_model_record(healed)  # the spec write lands
+
+        raw_edit = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(raw_edit)
+        assert raw_edit["model"] == "claude-opus-4.8"
+
+    def test_an_unpersisted_heal_keeps_the_record_so_it_retries(self, tmp_path: Path):
+        # The crash case: the heal never reaches disk, so nothing is retired and
+        # the next refresh un-pins again.
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": {"model": "auto"}}), encoding="utf-8")
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        lost = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(lost)
+        # _resolve_config_model_record is deliberately NOT called — no write landed.
+        assert agent_state.get_config_model("kirocrew") == "claude-opus-4.8"
+        retried = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(retried)
+        assert retried["model"] == "auto"
+
+    def test_the_real_write_path_retires_the_record(self, tmp_path: Path):
+        # Pins the CALL SITE, not just the helper: a real install writes the spec
+        # and must retire a record the un-pin superseded.
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "model": "claude-user-pinned",
+                    "tools": [],
+                    "allowedTools": [],
+                    "mcpServers": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        agent_state.set_config_model("kirocrew", "claude-user-pinned")
+        path = _run_install(tmp_path, cfg_dir)
+        written = json.loads(path.read_text(encoding="utf-8"))
+        assert written["model"] == "auto"
+        assert agent_state.get_config_model("kirocrew") is None
+
+    def test_a_failing_sidecar_write_does_not_fail_the_rebuild(self, tmp_path: Path):
+        # The spec is already committed by the time the record is retired, so a
+        # sidecar write error must not raise out and skip the remaining installs.
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "model": "claude-user-pinned",
+                    "tools": [],
+                    "allowedTools": [],
+                    "mcpServers": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        agent_state.set_config_model("kirocrew", "claude-user-pinned")
+        with patch(
+            "kiro_crew.agent_state.clear_config_model_if",
+            side_effect=OSError("read-only sidecar dir"),
+        ):
+            path = _run_install(tmp_path, cfg_dir)
+        written = json.loads(path.read_text(encoding="utf-8"))
+        assert written["model"] == "auto"
+        # Retained, so the next refresh retries the retirement.
+        assert agent_state.get_config_model("kirocrew") == "claude-user-pinned"
+
+
+class TestConfigModelSidecar:
+    """``config_model`` records what the global propagated, alongside the other
+    per-agent bookkeeping rather than in the kiro spec (which rejects unknown
+    fields)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        agent_state.prune("probe")
+        yield
+        agent_state.prune("probe")
+
+    def test_unset_reads_as_none(self):
+        assert agent_state.get_config_model("probe") is None
+
+    def test_round_trip(self):
+        agent_state.set_config_model("probe", "claude-opus-4.8")
+        assert agent_state.get_config_model("probe") == "claude-opus-4.8"
+
+    def test_clearing_drops_the_key(self):
+        agent_state.set_config_model("probe", "claude-opus-4.8")
+        agent_state.set_config_model("probe", None)
+        assert agent_state.get_config_model("probe") is None
+
+    def test_clearing_preserves_sibling_keys(self):
+        agent_state.set_model_managed("probe", True)
+        agent_state.set_cc_model("probe", "claude-sonnet-4.6")
+        agent_state.set_config_model("probe", "claude-opus-4.8")
+        agent_state.set_config_model("probe", None)
+        assert agent_state.get_model_managed("probe") is True
+        assert agent_state.get_cc_model("probe") == "claude-sonnet-4.6"
+
+    def test_empty_string_reads_as_unset(self):
+        agent_state.set_config_model("probe", "")
+        assert agent_state.get_config_model("probe") is None
+
+    def test_prune_removes_it(self):
+        agent_state.set_config_model("probe", "claude-opus-4.8")
+        agent_state.prune("probe")
+        assert agent_state.get_config_model("probe") is None
+
+
 # ── ensure_agent_materialized (self-heal for kiro-cli "Mode not found") ──
 
 

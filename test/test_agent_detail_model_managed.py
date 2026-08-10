@@ -47,6 +47,25 @@ async def test_patch_explicit_model_freezes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_patch_model_voids_propagated_provenance(tmp_path):
+    """An explicit editor write makes the spec model the editor's, so the
+    propagated-model record for it must not survive — otherwise re-selecting the
+    recorded value would be read as the old propagation and un-pinned when the
+    global returns to "auto"."""
+    agent_state.set_config_model("kirocrew", "claude-recorded")
+    cfg = tmp_path / "kirocrew.json"
+    cfg.write_text(json.dumps({"name": "kirocrew", "model": "claude-other"}))
+    request = _patch_request("kirocrew", {"model": "claude-recorded"})
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200
+    assert json.loads(cfg.read_text(encoding="utf-8"))["model"] == "claude-recorded"
+    assert agent_state.get_config_model("kirocrew") is None
+
+
+@pytest.mark.asyncio
 async def test_patch_clear_model_resumes_tracking(tmp_path):
     cfg = tmp_path / "kirocrew.json"
     cfg.write_text(

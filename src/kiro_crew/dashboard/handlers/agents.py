@@ -1315,6 +1315,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                             # Stored verbatim (canonical key); translated to a
                             # provider id at the config.loader factory boundary.
                             data["model"] = patch_body["model"] or None
+                            # This write makes the spec's model THIS editor's, so
+                            # any propagated-model provenance for it is void.
+                            # Without this, a pick that happens to equal the
+                            # recorded value would be read as the old propagation
+                            # and un-pinned when the global returns to "auto".
+                            agent_state.set_config_model(agent_name, None)
                             if data["model"] is None:
                                 data.pop("model", None)
                                 # Cleared/auto: resume tracking the shipped

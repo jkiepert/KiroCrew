@@ -7,18 +7,26 @@ the default agent (``--agent <name>`` resolves to default with only a stderr
 per-agent bookkeeping OUT of the kiro spec and in this sidecar, so every spec
 stays schema-valid for kiro-cli.
 
-Two values are tracked, both kept in this sidecar rather than the kiro spec:
+Three values are tracked, all kept in this sidecar rather than the kiro spec:
 
 - ``model_managed`` (bool): whether an agent's ``model`` should track the
   shipped ``defaults.json`` (so a default bump propagates) or is an explicit
   user pick frozen against future bumps.
 - ``cc_model`` (str): a per-agent model for the ``claude_code`` provider (that
   backend can't pick a per-agent model from ``--agent`` the way kiro-cli does).
+- ``config_model`` (str): the model the global ``agent.model`` last propagated
+  into this agent's spec, recorded only when that write REPLACED a different
+  value. Provenance for the write, so returning the global to "auto" can un-pin
+  a spec model Kiro Crew itself wrote. Equality is deliberately not treated as
+  provenance: the Agent Templates editor and a hand edit also write the spec, so
+  a spec that already agrees with the global may be someone else's pick. The
+  accepted cost is that a pin made before this record existed has no provenance
+  and is never un-pinned.
 
 State file (``~/.kiro/crew/agent_model_state.json``, honoring ``KIROCREW_HOME``)::
 
     {
-      "kirocrew":           {"model_managed": true},
+      "kirocrew":           {"model_managed": true, "config_model": "<pinned id>"},
       "kirocrew-heartbeat": {"cc_model": "claude-sonnet-4.6"}
     }
 
@@ -42,6 +50,7 @@ logger = logging.getLogger(__name__)
 _STATE_FILENAME = "agent_model_state.json"
 _MODEL_MANAGED = "model_managed"
 _CC_MODEL = "cc_model"
+_CONFIG_MODEL = "config_model"
 
 # Guards in-process read-modify-write races (e.g. dashboard PATCH vs gateway
 # refresh). Cross-process atomicity is provided by ``atomic_write``.
@@ -111,6 +120,56 @@ def set_cc_model(name: str, value: str | None) -> None:
         else:
             data.pop(name, None)
         _write(data)
+
+
+def get_config_model(name: str) -> str | None:
+    """Return the model the global ``agent.model`` propagated into this agent's
+    spec, or ``None`` when the global never pinned one."""
+    with _lock:
+        value = _entry(_read(), name).get(_CONFIG_MODEL)
+    return value if isinstance(value, str) and value else None
+
+
+def set_config_model(name: str, value: str | None) -> None:
+    """Record (or clear, when ``value`` is falsy) the propagated global model."""
+    with _lock:
+        data = _read()
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            entry = {}
+        if value:
+            entry[_CONFIG_MODEL] = str(value)
+        else:
+            entry.pop(_CONFIG_MODEL, None)
+        if entry:
+            data[name] = entry
+        else:
+            data.pop(name, None)
+        _write(data)
+
+
+def clear_config_model_if(name: str, expected: str) -> bool:
+    """Clear ``config_model`` only if it still equals *expected*.
+
+    Compare-and-clear under the same lock as the read, so a retirement decided
+    against one observed value cannot discard a NEWER record written between the
+    decision and the write (two rebuilds overlapping — one going to "auto", one
+    propagating a concrete model). Returns True when the clear happened.
+    """
+    if not expected:
+        return False
+    with _lock:
+        data = _read()
+        entry = data.get(name)
+        if not isinstance(entry, dict) or entry.get(_CONFIG_MODEL) != expected:
+            return False
+        entry.pop(_CONFIG_MODEL, None)
+        if entry:
+            data[name] = entry
+        else:
+            data.pop(name, None)
+        _write(data)
+    return True
 
 
 def prune(name: str) -> None:

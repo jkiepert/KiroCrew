@@ -272,6 +272,39 @@ class TestEffectiveModelPrecedence:
         assert resolve_effective_model(cfg, None) == "claude-opus-5"
 
 
+class TestUnpinnedSpecReachesTheResolver:
+    """End-to-end for the tier-4 read: once the propagation un-pins the spec,
+    the one resolver the composer chip and the wire both read must report Auto.
+    """
+
+    def test_spec_unpinned_by_a_return_to_auto_resolves_to_auto(
+        self, specs_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from kiro_crew import agent_state
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        spec = specs_dir / "kirocrew.json"
+        spec.write_text(
+            json.dumps({"name": "kirocrew", "model": "claude-opus-4.8"}), encoding="utf-8"
+        )
+        cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": ""}}, "auto")
+        # The pin is what the global propagated before it was set back to auto.
+        assert resolve_effective_model(cfg, "crew") == "claude-opus-4.8"
+
+        agent_state.prune("kirocrew")
+        agent_state.set_config_model("kirocrew", "claude-opus-4.8")
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": {"model": "auto"}}), encoding="utf-8")
+        spec_data = json.loads(spec.read_text(encoding="utf-8"))
+        try:
+            with unittest.mock.patch("kiro_crew.agent._mc_config_path", return_value=mc):
+                _refresh_dynamic_fields(spec_data)
+            spec.write_text(json.dumps(spec_data), encoding="utf-8")
+            assert resolve_effective_model(cfg, "crew") == ""
+        finally:
+            agent_state.prune("kirocrew")
+
+
 class TestSessionModelCoversEverySurface:
     """The crew tier must apply to Slack / cron / spawn, not just dashboard chat.
 
