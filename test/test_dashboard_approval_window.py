@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 
 import pytest
 
@@ -72,9 +73,15 @@ class TestDefaultsAreShort:
 
         src = inspect.getsource(chat_runner._run_chat)
         assert "wait_for(fut, timeout=7200.0)" not in src
+        # No literal at all, whatever its value: the original bug was an inlined
+        # 7200.0, and pinning only that number would let the next literal through.
+        assert not re.search(r"wait_for\(fut, timeout=\d", src)
         # Resolved into a local, not inlined into the await: the timeout card
-        # has to report the SAME number the wait actually used.
-        assert "_approval_window = tool_approval_timeout_secs()" in src
+        # has to report the SAME number the wait actually used. Resolved PER SLOT
+        # rather than from the global config, which is what lets an app-owned
+        # worker with no human responder take the background deny-fast instead of
+        # holding the attended window and being denied anyway.
+        assert "_approval_window = state.approval_timeout_for(slot)" in src
 
 
 class TestResolver:
@@ -258,7 +265,7 @@ class TestNoBudgetCard:
         from kiro_crew.dashboard import chat_runner
 
         src = inspect.getsource(chat_runner._run_chat)
-        idx = src.index("_approval_window = tool_approval_timeout_secs()")
+        idx = src.index("_approval_window = state.approval_timeout_for(slot)")
         branch = src[idx : idx + 1800]
         assert "if _approval_window <= 0:" in branch
         assert "format_approval_no_budget_card()" in branch
@@ -317,7 +324,7 @@ class TestTimeoutCard:
         from kiro_crew.dashboard import chat_runner
 
         src = inspect.getsource(chat_runner._run_chat)
-        idx = src.index("_approval_window = tool_approval_timeout_secs()")
+        idx = src.index("_approval_window = state.approval_timeout_for(slot)")
         branch = src[idx : idx + 2000]
         assert "except asyncio.TimeoutError:" in branch
         assert "format_approval_timeout_card(_approval_window)" in branch
