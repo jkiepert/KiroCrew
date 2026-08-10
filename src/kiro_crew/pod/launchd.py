@@ -387,6 +387,27 @@ def is_active(cfg: PodConfig, name: str) -> bool:
     return _PID_RE.search(cp.stdout or "") is not None
 
 
+def main_pid(cfg: PodConfig, name: str) -> int | None:
+    """PID of the pod's live process, or ``None`` when it is not running.
+
+    Same evidence :func:`is_active` reads, returning the pid itself so a caller can
+    bind per-boot state to the process that is actually running. An OPERATIONAL
+    failure raises for the same reason it does there: reporting "not running" would
+    fail open.
+    """
+    cp = _print(cfg, name)
+    if cp.returncode != 0:
+        if _service_absent(cp):
+            return None
+        raise LaunchdError(
+            f"launchctl print failed (rc={cp.returncode}) for "
+            f"{pod_label(cfg, name)}; cannot tell whether the pod is running, "
+            f"refusing to report it absent: {(cp.stderr or cp.stdout or '').strip()}"
+        )
+    found = _PID_RE.search(cp.stdout or "")
+    return int(found.group(1)) if found else None
+
+
 def unit_state(cfg: PodConfig, name: str) -> tuple[str, int]:
     """``(state, restarts)`` shaped like the systemd backend's return.
 

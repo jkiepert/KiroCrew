@@ -1917,14 +1917,12 @@ def _decline_shared_agent_home(*, audit: bool = True) -> Path | None:
     test's ``tmp_path``), or it is EXACTLY ``isolated_agents_dir(own data home)``
     — the dedicated ``<data home>/kiro/agents`` this instance's teardown owns.
 
-    That second case is the *mechanism* by which a genuinely isolated instance will
-    own its specs; it is NOT advice to set ``KIRO_HOME`` today. Nothing in this
-    repo sets it (``build_pod_env`` deliberately does not) because it also
-    relocates kiro-cli's session storage while KiroCrew still reads the host path
-    — see ``kiro_home()``'s scope caveat. The exemption is matched exactly rather
-    than by ancestry: "beneath the data home" reads the machine-wide
-    ``~/.kiro/agents`` as private the moment the data home is an ancestor of it
-    (``KIROCREW_HOME=$HOME`` is enough).
+    That second case is also how a pod owns its specs: ``build_pod_env`` gives every
+    pod its own ``KIRO_HOME`` under the pod home, which resolves to exactly
+    ``isolated_agents_dir(<pod data home>)`` and takes this exemption. The exemption
+    is matched exactly rather than by ancestry: "beneath the data home" reads the
+    machine-wide ``~/.kiro/agents`` as private the moment the data home is an
+    ancestor of it (``KIROCREW_HOME=$HOME`` is enough).
     """
     target = kiro_agents_dir_path().resolve()
     if target != kiro_agents_dir().resolve():

@@ -154,3 +154,18 @@ class PodConfig:
     def env_file(self, name: str) -> Path:
         """Per-pod env file holding pinned ``CHECKOUT=`` / ``PORT=`` / ``SEED=``."""
         return self.pods_dir / f"{name}.env"
+
+
+def pod_kiro_home(home_dir: Path) -> Path:
+    """The ``KIRO_HOME`` a pod runs with: kiro-cli's user dir inside the pod HOME.
+
+    One definition, because two callers must agree on it: ``build_pod_env`` EXPORTS
+    it, and :func:`kiro_crew.session_storage._replay_store_cotenants` decides
+    whether a pod shares the default instance's replay store by RESOLVING it. When
+    those two drift, the reclaim guard answers from a premise the runtime no longer
+    holds — a refusal no operator can clear, or a store shared without one.
+
+    Inside the pod HOME so the zero-residue teardown reclaims it with everything
+    else the pod wrote.
+    """
+    return home_dir / "kiro"

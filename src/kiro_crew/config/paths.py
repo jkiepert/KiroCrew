@@ -669,16 +669,14 @@ def kiro_home() -> Path:
     rewriting costs: managed MCP servers that read one credential while calling a
     gateway that expects another, and 403 on every call).
 
-    SCOPE CAVEAT — read before setting this. ``KIRO_HOME`` redirects kiro-cli's
-    WHOLE user directory (agents, prompts, skills, steering, settings, sessions),
-    but KiroCrew currently resolves the host ``~/.kiro`` for most of those readers
-    (session transcripts in ``session_map.py`` / ``acp/*`` / ``providers/acp.py``
-    / ``dashboard/handlers/usage.py``, and the ``settings/mcp.json`` registry).
-    Setting ``KIRO_HOME`` therefore moves where kiro-cli WRITES sessions without
-    moving where KiroCrew READS them, which breaks session resume. Only the agents
-    directory follows it today, so this is not yet a supported way to isolate an
-    instance — ``build_pod_env()`` deliberately does not set it. Bringing the
-    remaining readers through this resolver is the prerequisite.
+    SCOPE — ``KIRO_HOME`` redirects kiro-cli's WHOLE user directory (agents,
+    prompts, skills, steering, settings, sessions), so an instance that sets it must
+    have Kiro Crew resolve the same directory for the transcripts it reads back:
+    setting it while Kiro Crew read the host ``~/.kiro`` would move where kiro-cli
+    WRITES sessions without moving where Kiro Crew READS them, breaking session
+    resume and pruning mappings whose transcripts could no longer be seen. Every
+    transcript reader resolves through :func:`kiro_sessions_dir`, which is what
+    makes ``build_pod_env()``'s isolated ``KIRO_HOME`` safe.
 
     Rejects the same unsafe targets as :func:`_valid_override_home` (a
     filesystem/drive root, or a known POSIX system directory) so a malformed

@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -64,6 +65,9 @@ from kiro_crew.config.paths import (
     legacy_home,
 )
 from kiro_crew.history import ARCHIVE_DIR_NAME, ARCHIVE_SEGMENT_DELIMITER, SESSIONS_DIR_NAME
+from kiro_crew.pod import runtime as pod_runtime
+from kiro_crew.pod.config import PodConfig
+from kiro_crew.pod.runtime import PodError
 
 logger = logging.getLogger(__name__)
 
@@ -551,28 +555,94 @@ def select_reclaimable(
     return [u for u in _scan_units(index) if not u.active and u.age_days(clock) >= cutoff]
 
 
-def _replay_store_cotenants() -> list[str]:
-    """Names of pod instances that read the same kiro-cli replay store.
+def _resolved(path: Path) -> Path:
+    """*path* with links resolved, or itself when the filesystem cannot say.
 
-    A pod isolates ``KIROCREW_HOME`` but deliberately NOT ``KIRO_HOME``, so every
-    pod reads the machine-wide replay store while keeping its own session map. From
-    the default instance's side that is the mirror of the isolated-instance hazard:
-    the pod's sessions are absent from the map THIS process consults, so they read
-    as retired.
+    Every home/store comparison in this module goes through this: a symlinked HOME
+    would otherwise make the default home compare unequal to itself and report
+    every instance as isolated.
+    """
+    try:
+        return path.resolve()
+    except OSError:  # pragma: no cover - defensive
+        return path
+
+
+def _owns_its_replay_store(cfg: PodConfig, name: str, mine: Path) -> bool:
+    """True when pod *name*'s CURRENT boot recorded a store that is not *mine*.
+
+    The store comes from :func:`~kiro_crew.pod.runtime.bound_replay_store`: the value
+    the boot exported, stamped with that boot's pid and accepted only while that pid
+    is still the pod's running main process. Nothing here is inferred, and nothing
+    here trusts a record on its own:
+
+    * A reader re-deriving the path answers for a pod booted by today's code, while
+      a running pod may have been launched by an older one and would then be writing
+      into the shared store.
+    * A directory existing under the pod home is no better — a stale private store
+      survives a version rollback that reuses the pod's name.
+    * An unstamped record survives a downgrade of the pod control binary plus a
+      service-manager restart, which is a pod sharing the store while carrying a
+      record that says it does not.
+
+    Anything unprovable counts as sharing, so a pod is protected unless its own live
+    boot says otherwise.
+    """
+    store = pod_runtime.bound_replay_store(cfg, name)
+    return store is not None and _resolved(store) != mine
+
+
+def _replay_store_cotenants() -> list[str]:
+    """Names of pod instances that read the same kiro-cli replay store as this one.
+
+    A co-tenant is an instance whose resumable sessions live in THIS store while its
+    session map sits somewhere this process cannot read: from here those sessions
+    look retired, so a reclaim could stage and then empty a conversation a gateway
+    this process cannot see is still able to resume.
+
+    Two conditions, and a pod must meet BOTH:
+
+    * **It is live.** A directory under the pod root is not an instance: a stopped
+      pod holds no resumable session and has no process that could resume one, and a
+      home left behind by a pod that no longer exists holds nothing at all — while
+      being unclearable by the eviction the refusal tells the operator to run.
+      Liveness comes from :func:`~kiro_crew.pod.runtime.live_names` rather than
+      ``active_names`` because the listing shape reports an empty set both when
+      nothing runs and when the query failed, and this decision is unsafe under a
+      wrong "nothing is running".
+    * **It does not own its own store** — see :func:`_owns_its_replay_store`.
+
+    Every uncertainty resolves toward refusing. Only one thing short-circuits to
+    "no co-tenants": a host whose platform cannot run pods at all, which is a static
+    property rather than a probe — a FAILED probe on a platform that can run them
+    means liveness is unknown, so every pod counts. An empty pod root also answers
+    with no service-manager call, which is every install that never ran a pod.
 
     The pod root is host-side state at a known location, which makes this the one
     co-tenant that can actually be discovered. A dev gateway pointed at some other
     ``KIROCREW_HOME`` cannot be, and stays a documented limitation.
     """
-    raw = os.environ.get("KIROCREW_POD_ROOT")
-    pod_root = Path(raw).expanduser() if raw else Path.home() / ".kirocrew-pods"
+    cfg = PodConfig.load()
     try:
-        entries = list(pod_root.iterdir())
+        entries = [
+            entry.name
+            for entry in cfg.pod_root.iterdir()
+            if entry.is_dir() and not entry.name.startswith(".")
+        ]
     except OSError:
         return []
-    return sorted(
-        entry.name for entry in entries if entry.is_dir() and not entry.name.startswith(".")
-    )
+    if not entries:
+        return []
+    if not (platform_compat.IS_LINUX or platform_compat.IS_MACOS):
+        # Pods are service-manager units on Linux and macOS only, so no pod can be
+        # running here. A static platform fact, not a probe that could fail.
+        return []
+    try:
+        live = pod_runtime.live_names(cfg)
+    except (PodError, OSError, subprocess.SubprocessError):
+        return sorted(entries)
+    mine = _resolved(kiro_home())
+    return sorted(name for name in live if not _owns_its_replay_store(cfg, name, mine))
 
 
 def reclaim_block_reason() -> str:
@@ -599,43 +669,33 @@ def reclaim_block_reason() -> str:
     for a day is still resumable — so the operation is refused rather than
     attempted. Isolating both homes together, or neither, is safe.
     """
-
-    def _norm(path: Path) -> Path:
-        # A symlinked HOME would otherwise make the default home compare unequal to
-        # itself and report every instance as isolated.
-        try:
-            return path.resolve()
-        except OSError:  # pragma: no cover - defensive
-            return path
-
-    home = _norm(Path.home())
+    home = _resolved(Path.home())
     # BOTH of these are defaults, not isolation: an install that has not yet
     # migrated legitimately reports the legacy home, and treating that as an
     # isolated instance would refuse every pre-migration install.
-    defaults = {home / KIRO_BASE_DIR_NAME / CONFIG_DIR_LEAF, _norm(legacy_home())}
-    data = _norm(data_home())
+    defaults = {home / KIRO_BASE_DIR_NAME / CONFIG_DIR_LEAF, _resolved(legacy_home())}
+    data = _resolved(data_home())
     if data in defaults:
         # The mirror of the isolated-instance case, and just as destructive: a pod
-        # shares this store while keeping its own map, so ITS sessions read as
-        # retired from here. Only checked when the store is the default one, since
-        # that is the only store a pod reads.
-        if _norm(kiro_home()) == home / KIRO_BASE_DIR_NAME:
-            cotenants = _replay_store_cotenants()
-            if cotenants:
-                listed = ", ".join(cotenants[:3])
-                return (
-                    f"{len(cotenants)} other instance(s) share this kiro-cli session "
-                    f"store ({listed}), so their resumable sessions cannot be told "
-                    "apart from retired ones. Evict them with `kirocrew pod down "
-                    "<name>` to reclaim from here."
-                )
+        # that shares this store keeps its own map, so ITS sessions read as retired
+        # from here. Which pods those are is decided by resolving each pod's own
+        # store against this one, not by assuming what pods do.
+        cotenants = _replay_store_cotenants()
+        if cotenants:
+            listed = ", ".join(cotenants[:3])
+            return (
+                f"{len(cotenants)} other instance(s) share this kiro-cli session "
+                f"store ({listed}), so their resumable sessions cannot be told "
+                "apart from retired ones. Evict them with `kirocrew pod down "
+                "<name>` to reclaim from here."
+            )
         return ""
     # An isolated instance may reclaim only when its replay store is provably its
     # own. Testing against the DEFAULT store location would miss the sharing that
     # matters most: two isolated instances pointed at one custom KIRO_HOME see
     # neither the default store nor each other's maps. Requiring the store to live
     # inside this instance's data home fails closed on every such arrangement.
-    store = _norm(kiro_home())
+    store = _resolved(kiro_home())
     if store == data or data in store.parents:
         return ""
     return (

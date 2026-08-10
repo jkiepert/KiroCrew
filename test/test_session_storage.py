@@ -22,6 +22,8 @@ import pytest
 from kiro_crew import session_storage
 from kiro_crew.config import paths
 from kiro_crew.history import transcript_stem
+from kiro_crew.pod import runtime as pod_runtime
+from kiro_crew.pod.config import PodConfig
 from kiro_crew.session_storage import SessionIndex, SessionStorageError
 
 _NOW = 1_700_000_000.0
@@ -925,21 +927,183 @@ class TestSharedStoreRefusal:
         # The origin is still absent rather than occupied by a dangling link.
         assert not (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").exists()
 
-    def test_a_pod_sharing_the_default_store_blocks_the_default_instance(
+    def test_a_stale_pod_directory_does_not_block_reclaim(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The mirror case: a pod reads THIS store while keeping its own map."""
-        pod_root = tmp_path / "pods"
-        (pod_root / "wt-feature").mkdir(parents=True)
-        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
-        monkeypatch.delenv("KIROCREW_HOME", raising=False)
-        monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        """A pod home left behind by a pod that no longer runs is not an instance.
+
+        Counting directories refuses reclaim on every machine that has ever run a
+        pod, and the eviction the message recommends cannot clear a directory whose
+        pod is already gone.
+        """
+        self._default_instance(tmp_path, monkeypatch, pods=["wt-retired"])
+        monkeypatch.setattr(pod_runtime, "live_names", lambda _cfg: set())
+
+        assert session_storage.reclaim_block_reason() == ""
+
+    def test_an_empty_pod_root_costs_no_service_manager_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An install that never ran a pod must not pay for the guard."""
+        self._default_instance(tmp_path, monkeypatch, pods=[])
+
+        def refuse(*_args: object) -> set[str]:
+            raise AssertionError("an empty pod root must not be probed")
+
+        monkeypatch.setattr(pod_runtime, "live_names", refuse)
+
+        assert session_storage.reclaim_block_reason() == ""
+
+    def test_a_live_pod_keeping_its_own_store_does_not_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The normal modern pod: its transcripts are inside its own home."""
+        pod_root = self._default_instance(tmp_path, monkeypatch, pods=["wt-feature"])
+        # The store the pod's own boot recorded for itself.
+        self._record_live_boot(
+            monkeypatch, "wt-feature", str(pod_root / "wt-feature" / "kiro")
+        )
+        monkeypatch.setattr(pod_runtime, "live_names", lambda _cfg: {"wt-feature"})
+
+        assert session_storage.reclaim_block_reason() == ""
+
+    def test_a_live_pod_whose_store_was_never_recorded_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unrecorded pod is protected, not assumed isolated.
+
+        A running pod may have been launched by a CLI that recorded nothing, and it
+        would then be writing into this store. Nothing here may re-derive the path
+        to fill that gap: the derivation answers for a pod booted by today's code.
+        """
+        self._default_instance(tmp_path, monkeypatch, pods=["wt-legacy"])
+        monkeypatch.setattr(pod_runtime, "live_names", lambda _cfg: {"wt-legacy"})
+
+        reason = session_storage.reclaim_block_reason()
+        assert "share this kiro-cli session store" in reason
+        assert "wt-legacy" in reason
+
+    def test_a_record_from_an_earlier_boot_does_not_exempt_a_live_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A record is only evidence while the boot that wrote it is still running.
+
+        Downgrading the pod control binary and letting the service manager restart
+        the unit leaves the previous boot's record in place while the pod that comes
+        back shares this store. Binding the record to its boot's pid is what stops
+        that from reading as isolated.
+        """
+        pod_root = self._default_instance(tmp_path, monkeypatch, pods=["wt-feature"])
+        pod_runtime.record_replay_store(
+            PodConfig.load(), "wt-feature", str(pod_root / "wt-feature" / "kiro")
+        )
+        # The pod is running, but not as the process that wrote the record.
+        monkeypatch.setattr(pod_runtime, "live_names", lambda _cfg: {"wt-feature"})
+        monkeypatch.setattr(pod_runtime, "live_main_pid", lambda _cfg, _n: 999999)
 
         reason = session_storage.reclaim_block_reason()
         assert "share this kiro-cli session store" in reason
         assert "wt-feature" in reason
+
+    def test_a_pod_store_pointed_at_this_one_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An existing store is not enough when it IS this instance's store."""
+        pod_root = self._default_instance(tmp_path, monkeypatch, pods=["wt-feature"])
+        shared = pod_root / "wt-feature" / "kiro"
+        shared.mkdir(parents=True)
+        monkeypatch.setenv("KIRO_HOME", str(shared))
+        self._record_live_boot(monkeypatch, "wt-feature", str(shared))
+        monkeypatch.setattr(pod_runtime, "live_names", lambda _cfg: {"wt-feature"})
+
+        assert "share this kiro-cli session store" in session_storage.reclaim_block_reason()
+
+    def test_a_stopped_unrecorded_pod_does_not_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No live instance means no resumable session to protect."""
+        self._default_instance(tmp_path, monkeypatch, pods=["wt-legacy"])
+        monkeypatch.setattr(pod_runtime, "live_names", lambda _cfg: set())
+
+        assert session_storage.reclaim_block_reason() == ""
+
+    def test_an_unanswerable_liveness_probe_still_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """"Could not ask" must not be read as "nothing is running"."""
+        pod_root = self._default_instance(tmp_path, monkeypatch, pods=["wt-feature"])
+        # Recorded as isolated, so only the unanswerable probe can block it.
+        self._record_live_boot(
+            monkeypatch, "wt-feature", str(pod_root / "wt-feature" / "kiro")
+        )
+
+        def unavailable(_cfg: object) -> set[str]:
+            raise pod_runtime.PodError("systemctl timed out")
+
+        monkeypatch.setattr(pod_runtime, "live_names", unavailable)
+
+        assert "share this kiro-cli session store" in session_storage.reclaim_block_reason()
+
+    def test_a_platform_that_cannot_run_pods_does_not_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pods are service-manager units, so a Windows host can have none live.
+
+        A static platform property, unlike a service-manager probe: a probe that
+        FAILS on a platform that can run pods leaves liveness unknown, which must
+        refuse rather than short-circuit (see the unanswerable-probe test).
+        """
+        self._default_instance(tmp_path, monkeypatch, pods=["wt-legacy"])
+        monkeypatch.setattr(session_storage.platform_compat, "IS_LINUX", False)
+        monkeypatch.setattr(session_storage.platform_compat, "IS_MACOS", False)
+
+        def refuse(*_args: object) -> set[str]:
+            raise AssertionError("a platform without pods must not be probed")
+
+        monkeypatch.setattr(pod_runtime, "live_names", refuse)
+
+        assert session_storage.reclaim_block_reason() == ""
+
+    @staticmethod
+    def _record_live_boot(
+        monkeypatch: pytest.MonkeyPatch, name: str, store: str
+    ) -> None:
+        """Record *store* for *name* and make that boot the live main process."""
+        cfg = PodConfig.load()
+        pod_runtime.record_replay_store(cfg, name, store)
+        stamped = int(pod_runtime.read_env_file(cfg, name)[pod_runtime.BOOT_PID])
+        monkeypatch.setattr(pod_runtime, "live_main_pid", lambda _cfg, _n: stamped)
+
+    @staticmethod
+    def _default_instance(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pods: list[str]
+    ) -> Path:
+        """A default-home instance with *pods* as directories under the pod root.
+
+        The pod root is real host state, so it is pinned to a temp dir or the result
+        depends on whether the developer's machine happens to have pods.
+        """
+        pod_root = tmp_path / "pods"
+        pod_root.mkdir()
+        for name in pods:
+            (pod_root / name).mkdir()
+        # Pods are service-manager units, and the guard short-circuits on a host
+        # that cannot run them. These cases are about the co-tenant DECISION, so
+        # pin a pod-capable host instead of inheriting the runner's platform --
+        # otherwise the Windows shards never reach the decision under test.
+        monkeypatch.setattr(session_storage.platform_compat, "IS_LINUX", True)
+        monkeypatch.setattr(session_storage.platform_compat, "IS_MACOS", False)
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        # The per-pod env file is real host state too: the recorded store is read
+        # from it, so pin it to the temp dir or a test would read the operator's.
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "pod-env"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        # Pin the default home rather than clearing the memo, which would make the
+        # next data_home() initialize or migrate the operator's real data home.
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        return pod_root
 
     def test_no_pods_leaves_the_default_instance_able_to_reclaim(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
