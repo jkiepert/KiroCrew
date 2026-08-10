@@ -884,6 +884,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # are the app's own surface, same classification as its siblings above.
         "apps/builtins/code_review_sage/sage_lib/store.py",
         "apps/builtins/code_review_sage/sage_lib/discovery.py",
+        # `chat_session` scrubs every turn of a post-review conversation at its
+        # serialization boundary: the reviewer can repeat a credential it read in
+        # the diff, and a tool title carries the arguments it was called with. Same
+        # classification as its siblings — the app's own surface, rendered by this
+        # app's panel, not a core egress path.
+        "apps/builtins/code_review_sage/sage_lib/chat_session.py",
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",

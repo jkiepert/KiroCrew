@@ -18,6 +18,7 @@
     "apps.codeReviewSage.components.bandChips.all": "Filter chip above the report's findings list. Means 'no band filter — show every severity', not 'all' as a quantity.",
     "apps.codeReviewSage.components.leftRail.version": "Version chip in the app rail's identity row, e.g. \"v2.0\". `{{version}}` is the number — keep the prefix short, and drop it entirely if your locale does not prefix version numbers.",
     "apps.codeReviewSage.components.prPickList.new": "Badge on a pull request in the picker, marking one that appeared since the last review of this repository. An ADJECTIVE describing the pull request.",
+    "apps.codeReviewSage.components.reviewChat.role_you": "Speaker label above the reader's own question in the Code Review Sage chat transcript, paired with \"Reviewer\" for the agent's replies; the second-person pronoun addressing the current user, not the possessive \"your\".",
     "apps.crewCompanion.breathe.end": "Label on the button that stops the breathing exercise before it finishes, inside the exercise overlay. An imperative verb (\"stop this now\"), not the noun \"the end\" — several languages use different words for the two.",
     "apps.crewCompanion.reminders.add_button": "Button that saves the reminder typed in the box beside it. The verb \"add\", not the arithmetic sense.",
     "apps.crewCompanion.settings.custom_placeholder": "Placeholder in a small number field for a custom break interval. Short for \"minutes\" (the unit), not \"minimum\".",
